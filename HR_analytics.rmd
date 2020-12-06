@@ -1,0 +1,379 @@
+---
+title: "Employee Analytics"
+author: "Joe Cristian"
+date: "5/12/2020"
+output: 
+ html_document:
+   toc: true
+   toc_float: true
+   df_print: paged
+   highlight: zenburn
+   theme: flatly
+   toc_depth: 3
+---
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE,
+                      fig.align = "center")
+options(scipen = 999)
+```
+
+HR analytics is revolutionising the way human resources departments operate, leading to higher efficiency and better results overall. Human resources has been using analytics for years. However, the collection, processing and analysis of data has been largely manual, and given the nature of human resources dynamics and HR KPIs, the approach has been constraining HR. Therefore, it is surprising that HR departments woke up to the utility of machine learning so late in the game. In this opportunity, we're going to do predictive analytics in identifying the employees most likely to get promoted.
+
+```{r,echo=FALSE}
+knitr::include_graphics("hr-header.jpg")
+```
+
+# Background {.tabset}
+## Objective
+
+Your client is a large MNC and they have 9 broad verticals across the organisation. One of the problem your client is facing is around identifying the right people for promotion (only for manager position and below) and prepare them in time. Currently the process, they are following is:
+1. They first identify a set of employees based on recommendations/ past performance
+2. Selected employees go through the separate training and evaluation program for each vertical. These programs are based on the required skill of each vertical
+3. At the end of the program, based on various factors such as training performance, KPI completion (only employees with KPIs completed greater than 60% are considered) etc., employee gets promotion
+
+For above mentioned process, the final promotions are only announced after the evaluation and this leads to delay in transition to their new roles. Hence, company needs your help in identifying the eligible candidates at a particular checkpoint so that they can expedite the entire promotion cycle. They have provided multiple attributes around Employee's past and current performance along with demographics. Now, The task is to predict whether a potential promotee at checkpoint in the test set will be promoted or not after the evaluation process.
+
+
+## Libraries
+
+```{r,message=FALSE,warning=FALSE}
+library(tidyverse)
+library(zoo)
+library(ggplot2)
+library(plotly)
+library(UBL)
+library(tidymodels)
+library(caret)
+```
+
+# Let's Begin
+## Data Import
+```{r}
+dat <- read.csv("data/train.csv",stringsAsFactors = T)
+head(dat)
+```
+
+Variable Definition:
+- `employee_id`:	Unique ID for employee
+- `department`:	Department of employee
+- `region`:	Region of employment (unordered)
+- `education`:	Education Level
+- `gender`:	Gender of Employee
+- `recruitment_channel`:	Channel of recruitment for employee
+- `no_of_trainings`:	no of other trainings completed in previous year on soft skills, technical skills etc.
+- `age`:	Age of Employee
+- `previous_year_rating`:	Employee Rating for the previous year
+- `length_of_service`:	Length of service in years
+- `KPIs_met` >80%:	if Percent of KPIs(Key performance Indicators) >80% then 1 else 0
+- `awards_won`?:	if awards won during previous year then 1 else 0
+- `avg_training_score`:	Average score in current training evaluations
+- `is_promoted`:	(Target) Recommended for promotion
+
+```{r}
+dat <- dat %>% 
+  mutate(employee_id = as.character(employee_id),
+         KPIs_met..80. = as.factor(KPIs_met..80.),
+         awards_won. = as.factor(awards_won.),
+         is_promoted = as.factor(is_promoted),
+         previous_year_rating = replace_na(previous_year_rating,0), # fill na with 0
+         education = na_if(education,""),
+         education = na.locf(education), # fill blank with previous value
+         education = as.factor(education))
+dat
+```
+
+
+## Exploratory Data Analysis
+
+Before we do the analysis, its often a good idea to know the data first. Employee in the company is well-seperated by their department. Lets see which department has the most promotion
+```{r,message=FALSE}
+dat %>% 
+  group_by(is_promoted,department) %>% 
+  summarise(freq = n()) %>% 
+  filter(is_promoted == 1) %>% 
+  arrange(-freq)
+
+```
+
+By quantity, employee in `Sales & Marketing` may has the highest promoted but it might because the department also has the highest member than the others in the company. 
+
+```{r}
+prop.table(table(dat$department)) %>% 
+  data.frame() %>% 
+  arrange(-Freq)
+```
+
+It's true that `Sales & Marketing` department has the highest member in the company, so its makes sense if they also has the highest promotion. let's see the proportion of employee being promoted from their own department
+
+```{r,message=FALSE}
+dat %>% 
+  group_by(department,is_promoted) %>% 
+  summarise(freq = n()) %>% 
+  ungroup() %>% 
+  pivot_wider(names_from = "is_promoted",values_from = "freq",names_prefix = "promoted") %>% 
+  mutate(prop_promoted = promoted1/(promoted0+promoted1)) %>% 
+  arrange(-prop_promoted) %>% 
+  mutate(prop_promoted = scales::percent(prop_promoted))
+```
+
+Employee in `Technology` department has the highest 'chance' to get promoted. 10.7% of them get a promotion compared to `Sales & Marketing` which only 7.2%. So what makes `Technology` department different? Lets see how employee in `Technology` department performance compared with other department
+```{r,message=FALSE}
+p1 <- dat %>% 
+  group_by(department,KPIs_met..80.,education) %>% 
+  summarise(f = n()) %>% 
+  ggplot(aes(x = f, y = department)) +
+  geom_col(aes(fill = department),show.legend = F) +
+  facet_grid(KPIs_met..80.~education,scales = "free_x") +
+  labs(title = "Employee KPI Completion",
+       subtitle = "Based on its Department and Education Levels",
+       caption = "Note: 1 = Met KPIs Completion, 0 = Doesn't meet",
+       x = "Freqency", y = "Department") +
+  theme_minimal() +
+  theme(strip.background = element_rect(fill = "firebrick"),
+         strip.text.x = element_text(colour = "white"))
+p1
+```
+
+From the plot we know that employee with bachelor’s degree has low frequency to meet the KPI standard. The company decided to only give promotion to employee who has KPI completion greater than 60%. So it’s important to analyze the KPI variable first to narrow our analysis.
+
+Employee who met the KPI standard are actually similar if we look at their education levels. Maybe there are another variables which has more significant impact to employee’s promotion.
+
+```{r,fig.width=8}
+p2 <- dat %>% 
+  ggplot(aes(x = department,y = avg_training_score)) +
+  geom_boxplot(aes(fill = is_promoted)) +
+  facet_wrap(~department,scales = "free_x",nrow=1)+
+  scale_fill_discrete(name = "Is Promoted?",labels=c("No","Yes")) +
+  labs(title = "Employee Average Training Score",
+       subtitle = "Based on its Department",
+       x = "Department", y = "Average Training Score")+
+  theme_minimal() +
+  theme(axis.text.x = element_blank(),
+        strip.background = element_rect(fill = "firebrick"),
+        strip.text.x = element_text(colour = "white"),
+        legend.position = "bottom")
+
+p2
+```
+
+In this plot, we analyze employee’s promotion from their average training score variable. It is save to assume that employee with higher average training score are most likely getting promoted. From this plot we also know that employee from Analytics, R&D, and Technology Department are the best department with highest average training score. 
+
+We know that `education` may have low correlation to met the `KPI` standards and high `Average training score` tend to make the employees to get a promotion. Actually, we can calculate which variables has siginificant effect to employee' promotion using `logistic regression`
+
+## Logistic Regression
+```{r}
+dat$is_promoted <- relevel(dat$is_promoted,ref = "1") # set target reference to 1
+# train logistic regression model using all variables
+full_mod <- glm(is_promoted ~., data = dat[,-1],family = "binomial") 
+# apply backward stepwise to remove un-significant variables 
+stats::step(full_mod,direction = "backward",trace = 0)
+```
+
+best logistic regression model from stepwise
+```{r}
+glm_best <- glm(formula = is_promoted ~ department + region + education + 
+    no_of_trainings + age + previous_year_rating + length_of_service + 
+    KPIs_met..80. + awards_won. + avg_training_score, family = "binomial", 
+    data = dat[, -1])
+summary(glm_best)
+```
+
+From the summary above we know that,statistically, not all variables have a significant effect to target variables. variables like `gender`, `recruitment channel`, and `Previous year training` have no, if not low, effect on employee promotion. Every `department` seems like has an equal chance of being promoted except `R&D` department but it still has low p-value. From 34 `Region`, region `#4` have the lowest p-value, means employee from that region is most likely get a promotion. Almost every variable left has equal significant effect to target variable. We can summarize that employee need to increase their `KPI`, `Training score`, loyalty that can be seen from `length of service`, `number of trainings`, and `won an award` to become a candidate for promotion.
+
+
+```{r,message=FALSE,warning=FALSE}
+GGally::ggcorr(dat %>% select(.,is.numeric),label = T)
+```
+
+`age` and `length_of_service` has high correlation. it make sense but we need to do something about it to avoid multicollinearity. we will do some feature engineering before modeling
+
+```{r}
+table(dat$no_of_trainings)
+```
+We also need to change `no_of_trainings` to 2 tier since the variable is so imbalance and that isn't good if we want to scale the numeric data based on its median.
+
+
+# Modeling
+```{r}
+# set employee id to rownames
+rownames(dat) <- dat$employee_id
+dat <- dat[,-1]
+```
+
+```{r}
+# feature engineering
+# change age to 3 tier and no_of_trainings to 2 tier
+# remove duplicate row
+dat <- dat %>% 
+  mutate(age = as.factor(case_when(age < 30 ~ "junior",
+                         age >= 30 & age <=40 ~ "fresh",
+                         age >40 ~ "senior")),
+         no_of_trainings = as.factor(ifelse(no_of_trainings < 2,"rarely","often"))) %>% 
+  distinct()
+
+# robust scaling using median instead of mean
+dat_num <- dat %>% 
+  select_if(is.numeric) %>% 
+  quantable::robustscale()
+
+dat <- cbind(dat_num$data,dat %>% select_if(is.factor))
+dat
+```
+
+## Cross validation
+
+```{r}
+set.seed(123)
+splitter <- initial_split(dat,prop = 0.8,strata = "is_promoted")
+train <- training(splitter)
+test <- testing(splitter)
+```
+
+## Balancing
+```{r}
+prop.table(table(train$is_promoted))
+```
+
+The target level is imbalance so we need to balance it using downsampling. We also dont want the data to be exact 50:50. We want the unbalance nature to still exist in train data since that's what actually happen in real life.
+
+```{r}
+set.seed(123)
+recipe <- recipe(is_promoted~., data = train) %>% 
+  step_downsample(is_promoted,under_ratio = 1/0.55,seed = 123) %>% 
+  prep()
+
+train_balance <- juice(recipe)
+test <- bake(recipe,test)
+```
+
+```{r}
+prop.table(table(train_balance$is_promoted))
+```
+
+## Random Forest
+
+Set k-fold cross validation
+```{r}
+set.seed(123)
+folds <- vfold_cv(train_balance,3,strata = "is_promoted")
+```
+
+grid tuning. we will tune the `mtry` and `trees` parameter using grid tuning. this process will take a lot of time because it will train all possible paramter combination and extract the best result. we will aim the highest `F1 score` as our best model.
+```{r}
+# trees and mtry grid combination 
+rf.grid <- expand.grid(trees = seq(450,650,50), mtry = 3:7)
+
+# model setup. random forest using ranger engine where the trees and mtry 
+# will be changed by its grid
+rf.setup <- rand_forest(trees = tune(), mtry = tune()) %>%
+  set_engine("ranger") %>%
+  set_mode("classification")
+
+# formula workflow
+rf.wf <- workflow() %>% 
+  add_model(rf.setup) %>% 
+  add_recipe(recipe(is_promoted ~.,data = train_balance))
+
+# fit the data to model workflow
+# rf.tune <- tune_grid(rf.wf,resamples = folds,grid = rf.grid,
+#                      metrics = metric_set(accuracy, sens, spec,yardstick::precision,f_meas))
+
+```
+
+
+```{r}
+rf.tune <- readRDS("rf_tune.rds")
+show_best(rf.tune,metric = "f_meas")
+```
+
+random forest with 7 mtry and 500 tree is the best model based on f1 score. we will use it as our main random forest model
+```{r}
+rf_best <- rf.wf %>% 
+  finalize_workflow(select_best(rf.tune,"f_meas")) %>% 
+  fit(train_balance)
+
+rf_pred <- predict(rf_best,test,type = "prob")
+
+```
+
+We have imbalance data so it isn't wise to use `accuracy` as our metric. we predict the test data and pull the probability instead the predicted class. From the probabilty, we will set the optimal cutoff with the most balance `precision` and `recall.` we will use `cmplot` package to see the cutoff. you can install `cmplot` package from this github https://github.com/ahmadhusain/cmplot
+
+```{r,message=FALSE,warning=FALSE}
+library(cmplot)
+confmat_plot(prob = rf_pred$.pred_1,ref = test$is_promoted,postarget = "1",negtarget = "0")
+```
+
+From the plot above, it looks like cutoff = 0.6483 is the best cutoff to get the most balanced precision and recall. let's how it seen in confusion matrix
+```{r,warning=FALSE}
+rf_pred$class <- as.factor(ifelse(rf_pred$.pred_1 > 0.6483,"1","0"))
+cm_rf <- confusionMatrix(rf_pred$class,test$is_promoted,positive = "1")
+cm_rf
+```
+
+We have high accuracy: 90.7% but low precision and sensitivity. the matrix also does'nt look that good because we have lots of false positive and false negative. but that's still tolerable considering this is an imbalance target classes
+
+Let's try another algorithm. this time we will use XGBoost.
+
+## XGBoost
+```{r}
+rf.grid <- expand.grid(trees = seq(450,650,50), mtry = 3:7)
+
+xg.setup <- boost_tree(trees = tune(), mtry = tune(),learn_rate = 0.1,tree_depth = 5) %>%
+  set_engine("xgboost") %>%
+  set_mode("classification")
+
+xg.wf <- workflow() %>% 
+  add_formula(is_promoted ~ .) %>% 
+  add_model(xg.setup)
+
+# xg.tune <- tune_grid(xg.wf,resamples = folds, grid = rf.grid,
+#                      metrics = metric_set(accuracy, sens, spec,yardstick::precision,f_meas))
+
+```
+
+```{r}
+xg.tune <- readRDS("xg_tune.rds")
+show_best(xg.tune,metric = "f_meas")
+```
+
+random forest with 7 mtry and 650 tree is the best model based on f1 score. we will use it as our main XGBoost model
+```{r}
+xg_best <- xg.wf %>% 
+  finalize_workflow(select_best(xg.tune,"f_meas")) %>% 
+  fit(train_balance)
+
+xg_pred <- predict(xg_best,test,type = "prob")
+
+```
+
+```{r,message=FALSE,warning=FALSE}
+confmat_plot(prob = xg_pred$.pred_1,ref = test$is_promoted,postarget = "1",negtarget = "0")
+```
+
+From the plot above, it looks like cutoff = 0.6483 is the best cutoff to get the most balanced precision and recall. let's see how it looks in confusion matrix
+```{r,warning=FALSE}
+xg_pred$class <- as.factor(ifelse(xg_pred$.pred_1 > 0.6483,"1","0"))
+cm_xg <- confusionMatrix(xg_pred$class,test$is_promoted,positive = "1")
+cm_xg
+```
+
+We have higher accuracy than Random forest model: 90.9%. Still low precision and sensitivity, but slightly better than random forest. 
+
+# Model Evaluation
+```{r}
+eval <- data.frame(
+   Accuracy = c(cm_rf$overall[1],cm_xg$overall[1]),
+   Sensitivity = c(cm_rf$byClass[1],cm_xg$byClass[1]),
+   Specificity = c(cm_rf$byClass[2],cm_xg$byClass[2]),
+   Precision = c(cm_rf$byClass[5],cm_xg$byClass[5]),
+   Recall = c(cm_rf$byClass[6],cm_xg$byClass[6]),
+   F1 = c(cm_rf$byClass[7],cm_xg$byClass[7])
+) %>% `rownames<-`(c("Random Forest","XGBoost"))
+
+eval
+```
+
+
+
